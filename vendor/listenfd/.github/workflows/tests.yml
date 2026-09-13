@@ -1,0 +1,45 @@
+name: Tests
+
+on: [push]
+
+jobs:
+  test-latest:
+    name: Test on Latest
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: make test
+
+  test-windows-latest:
+    name: Build on Latest (Windows)
+    runs-on: windows-2019
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo check
+
+  test-stable:
+    name: Build on 1.42.0
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.42.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Restore Cargo.lock
+        run: cp Cargo.lock.msrv Cargo.lock
+      - name: Build
+        run: cargo check

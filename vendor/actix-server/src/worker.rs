@@ -1,0 +1,746 @@
+use std::{
+    future::Future,
+    io, mem,
+    num::NonZeroUsize,
+    pin::Pin,
+    rc::Rc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
+
+use actix_rt::{
+    spawn,
+    time::{sleep, Instant, Sleep},
+    Arbiter, ArbiterHandle, System,
+};
+use futures_core::{future::LocalBoxFuture, ready};
+use tokio::{
+    runtime::{Builder, LocalOptions},
+    sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
+};
+use tracing::{error, info, trace};
+
+use crate::{
+    service::{BoxedServerService, InternalServiceFactory},
+    socket::MioStream,
+    waker_queue::{WakerInterest, WakerQueue},
+};
+
+// Based on the default maximum blocking thread count of a Tokio runtime.
+const DEFAULT_BLOCKING_THREAD_BUDGET: usize = 512;
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Stop worker message. Returns `true` on successful graceful shutdown
+/// and `false` if some connections still alive when shutdown execute.
+pub(crate) struct Stop {
+    graceful: bool,
+    tx: oneshot::Sender<bool>,
+}
+
+#[derive(Debug)]
+pub(crate) struct Conn {
+    pub io: MioStream,
+    pub token: usize,
+}
+
+/// Create accept and server worker handles.
+fn handle_pair(
+    idx: usize,
+    conn_tx: UnboundedSender<Conn>,
+    stop_tx: UnboundedSender<Stop>,
+    counter: Counter,
+) -> (WorkerHandleAccept, WorkerHandleServer) {
+    let accept = WorkerHandleAccept {
+        idx,
+        conn_tx,
+        counter,
+    };
+
+    let server = WorkerHandleServer { idx, stop_tx };
+
+    (accept, server)
+}
+
+/// Shared connection counter for the accept thread and one server worker.
+///
+/// The accept thread increments the counter after it sends a connection to the worker. The worker
+/// decrements the counter when the connection's guard is dropped.
+///
+/// # Worker Availability From The Accept Thread's Perspective
+///
+/// The accept thread has access to each worker's counter through [`WorkerHandleAccept`], but uses
+/// its cached [`Availability`] flags to choose a worker. After it sends a connection, it increments
+/// that worker's counter. If the increment reaches the connection limit, it marks the worker
+/// unavailable and stops sending it connections until the worker reports that capacity is available.
+///
+/// # Counter Offset
+///
+/// The raw counter starts at one to prevent an underflow during the following (race) condition. An
+/// idle worker has a raw count of one. If it receives and finishes a connection before the accept
+/// thread increments the counter, dropping the connection's guard changes the raw count from one to
+/// zero. Another read can observe zero until the accept thread performs the pending increment,
+/// which restores the idle value of one.
+///
+/// # Restoring Worker Availability
+///
+/// When a decrement takes the connection count below the limit (signalled by the return value of
+/// [`dec`]), the worker queues a `WorkerAvailable` notification in `WakerQueue` and wakes the
+/// accept thread through `mio::Waker`. The accept thread updates its cached availability flag and
+/// resumes accepting connections unless the server is paused. Further decrements below the limit do
+/// not need to wake the accept thread.
+///
+/// [`Availability`]: crate::availability::Availability
+/// [`dec`]: Self::dec
+#[derive(Clone)]
+pub(crate) struct Counter {
+    /// Raw counter value.
+    ///
+    /// Always one higher than the actual connection count except in the rare race condition
+    /// described in the struct docs.
+    counter: Arc<AtomicUsize>,
+
+    /// The connection limit.
+    limit: usize,
+}
+
+impl Counter {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            counter: Arc::new(AtomicUsize::new(1)),
+            limit,
+        }
+    }
+
+    /// Increments the counter by one.
+    ///
+    /// Returns true if connection limit was reached with this increment.
+    #[inline(always)]
+    pub(crate) fn inc(&self) -> bool {
+        let prev = self.counter.fetch_add(1, Ordering::Relaxed);
+
+        prev != self.limit
+    }
+
+    /// Decrements the counter by one.
+    ///
+    /// Returns true when connection count drops below the limit.
+    #[inline(always)]
+    pub(crate) fn dec(&self) -> bool {
+        let prev = self.counter.fetch_sub(1, Ordering::Relaxed);
+
+        Some(prev) == self.limit.checked_add(1)
+    }
+
+    /// Returns number of connections currently being handled.
+    pub(crate) fn total(&self) -> usize {
+        self.counter.load(Ordering::SeqCst) - 1
+    }
+}
+
+pub(crate) struct WorkerCounter {
+    idx: usize,
+    inner: Rc<(WakerQueue, Counter)>,
+}
+
+impl Clone for WorkerCounter {
+    fn clone(&self) -> Self {
+        Self {
+            idx: self.idx,
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl WorkerCounter {
+    pub(crate) fn new(idx: usize, waker_queue: WakerQueue, counter: Counter) -> Self {
+        Self {
+            idx,
+            inner: Rc::new((waker_queue, counter)),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn guard(&self) -> WorkerCounterGuard {
+        WorkerCounterGuard(self.clone())
+    }
+
+    fn total(&self) -> usize {
+        self.inner.1.total()
+    }
+}
+
+pub(crate) struct WorkerCounterGuard(WorkerCounter);
+
+impl Drop for WorkerCounterGuard {
+    fn drop(&mut self) {
+        let (waker_queue, counter) = &*self.0.inner;
+        if counter.dec() {
+            waker_queue.wake(WakerInterest::WorkerAvailable(self.0.idx));
+        }
+    }
+}
+
+/// Handle to worker that can send connection message to worker and share the availability of worker
+/// to other threads.
+///
+/// Held by [Accept](crate::accept::Accept).
+pub(crate) struct WorkerHandleAccept {
+    idx: usize,
+    conn_tx: UnboundedSender<Conn>,
+    counter: Counter,
+}
+
+impl WorkerHandleAccept {
+    #[inline(always)]
+    pub(crate) fn idx(&self) -> usize {
+        self.idx
+    }
+
+    #[inline(always)]
+    pub(crate) fn send(&self, conn: Conn) -> Result<(), Conn> {
+        self.conn_tx.send(conn).map_err(|msg| msg.0)
+    }
+
+    #[inline(always)]
+    pub(crate) fn inc_counter(&self) -> bool {
+        self.counter.inc()
+    }
+}
+
+/// Handle to worker than can send stop message to worker.
+///
+/// Held by [ServerBuilder](crate::builder::ServerBuilder).
+#[derive(Debug)]
+pub(crate) struct WorkerHandleServer {
+    pub(crate) idx: usize,
+    stop_tx: UnboundedSender<Stop>,
+}
+
+impl WorkerHandleServer {
+    pub(crate) fn stop(&self, graceful: bool) -> oneshot::Receiver<bool> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.stop_tx.send(Stop { graceful, tx });
+        rx
+    }
+}
+
+/// Service worker.
+///
+/// Worker accepts Socket objects via unbounded channel and starts stream processing.
+pub(crate) struct ServerWorker {
+    // UnboundedReceiver<Conn> should always be the first field.
+    // It must be dropped as soon as ServerWorker dropping.
+    conn_rx: UnboundedReceiver<Conn>,
+    stop_rx: UnboundedReceiver<Stop>,
+    counter: WorkerCounter,
+    services: Box<[WorkerService]>,
+    factories: Box<[Box<dyn InternalServiceFactory>]>,
+    state: WorkerState,
+    shutdown_timeout: Duration,
+}
+
+struct WorkerService {
+    factory_idx: usize,
+    status: WorkerServiceStatus,
+    service: BoxedServerService,
+}
+
+impl WorkerService {
+    fn created(&mut self, service: BoxedServerService) {
+        self.service = service;
+        self.status = WorkerServiceStatus::Unavailable;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum WorkerServiceStatus {
+    Available,
+    #[default]
+    Unavailable,
+    Failed,
+    Restarting,
+    Stopping,
+    Stopped,
+}
+
+/// Config for worker behavior passed down from server builder.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServerWorkerConfig {
+    shutdown_timeout: Duration,
+    max_blocking_threads: usize,
+    max_concurrent_connections: usize,
+}
+
+impl Default for ServerWorkerConfig {
+    fn default() -> Self {
+        let parallelism = std::thread::available_parallelism().map_or(2, NonZeroUsize::get);
+
+        let max_blocking_threads = std::cmp::max(DEFAULT_BLOCKING_THREAD_BUDGET / parallelism, 1);
+
+        Self {
+            shutdown_timeout: Duration::from_secs(30),
+            max_blocking_threads,
+            max_concurrent_connections: 25600,
+        }
+    }
+}
+
+impl ServerWorkerConfig {
+    pub(crate) fn max_blocking_threads(&mut self, num: usize) {
+        self.max_blocking_threads = num;
+    }
+
+    pub(crate) fn max_concurrent_connections(&mut self, num: usize) {
+        self.max_concurrent_connections = num;
+    }
+
+    pub(crate) fn shutdown_timeout(&mut self, dur: Duration) {
+        self.shutdown_timeout = dur;
+    }
+}
+
+impl ServerWorker {
+    pub(crate) fn start(
+        idx: usize,
+        factories: Vec<Box<dyn InternalServiceFactory>>,
+        waker_queue: WakerQueue,
+        config: ServerWorkerConfig,
+    ) -> io::Result<(WorkerHandleAccept, WorkerHandleServer)> {
+        trace!("starting server worker {}", idx);
+
+        let (tx1, conn_rx) = unbounded_channel();
+        let (tx2, stop_rx) = unbounded_channel();
+
+        let counter = Counter::new(config.max_concurrent_connections);
+        let pair = handle_pair(idx, tx1, tx2, counter.clone());
+
+        // get actix system context if it is set
+        let actix_system = System::try_current();
+
+        // get tokio runtime handle if it is set
+        let tokio_handle = tokio::runtime::Handle::try_current().ok();
+
+        // service factories initialization channel
+        let (factory_tx, factory_rx) = std::sync::mpsc::sync_channel::<io::Result<()>>(1);
+
+        // every worker runs in it's own thread and tokio runtime.
+        // use a custom tokio runtime builder to change the settings of runtime.
+
+        match (actix_system, tokio_handle) {
+            (None, None) => {
+                panic!("No runtime detected. Start a Tokio (or Actix) runtime.");
+            }
+
+            // no actix system
+            (None, Some(_)) => {
+                std::thread::Builder::new()
+                    .name(format!("actix-server worker {idx}"))
+                    .spawn(move || {
+                        let (worker_stopped_tx, worker_stopped_rx) = oneshot::channel();
+
+                        let rt = Builder::new_current_thread()
+                            .enable_all()
+                            .max_blocking_threads(config.max_blocking_threads)
+                            .build_local(LocalOptions::default())
+                            .unwrap();
+
+                        // init services using the worker's local runtime
+                        let services = rt.block_on(async {
+                            let mut services = Vec::new();
+
+                            for (idx, factory) in factories.iter().enumerate() {
+                                match factory.create().await {
+                                    Ok((token, svc)) => services.push((idx, token, svc)),
+
+                                    Err(err) => {
+                                        error!("can not start worker: {err:?}");
+                                        return Err(io::Error::other(format!(
+                                            "can not start server service {idx}",
+                                        )));
+                                    }
+                                }
+                            }
+
+                            Ok(services)
+                        });
+
+                        let services = match services {
+                            Ok(services) => {
+                                factory_tx.send(Ok(())).unwrap();
+                                services
+                            }
+                            Err(err) => {
+                                factory_tx.send(Err(err)).unwrap();
+                                return;
+                            }
+                        };
+
+                        let worker_services = wrap_worker_services(services);
+
+                        let worker_fut = async move {
+                            // spawn to make sure ServerWorker runs as non boxed future.
+                            spawn(async move {
+                                ServerWorker {
+                                    conn_rx,
+                                    stop_rx,
+                                    services: worker_services.into_boxed_slice(),
+                                    counter: WorkerCounter::new(idx, waker_queue, counter),
+                                    factories: factories.into_boxed_slice(),
+                                    state: WorkerState::default(),
+                                    shutdown_timeout: config.shutdown_timeout,
+                                }
+                                .await;
+
+                                // wake up outermost task waiting for shutdown
+                                worker_stopped_tx.send(()).unwrap();
+                            });
+
+                            worker_stopped_rx.await.unwrap();
+                        };
+
+                        rt.block_on(worker_fut);
+                    })
+                    .expect("cannot spawn server worker thread");
+            }
+
+            // with actix system
+            (Some(_sys), _) => {
+                let arbiter = {
+                    Arbiter::with_tokio_rt(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .max_blocking_threads(config.max_blocking_threads)
+                            .build()
+                            .unwrap()
+                    })
+                };
+
+                arbiter.spawn(async move {
+                    // spawn_local to run !Send future tasks.
+                    spawn(async move {
+                        let mut services = Vec::new();
+
+                        for (idx, factory) in factories.iter().enumerate() {
+                            match factory.create().await {
+                                Ok((token, svc)) => services.push((idx, token, svc)),
+
+                                Err(err) => {
+                                    error!("can not start worker: {err:?}");
+                                    Arbiter::current().stop();
+                                    factory_tx
+                                        .send(Err(io::Error::other(format!(
+                                            "can not start server service {idx}",
+                                        ))))
+                                        .unwrap();
+                                    return;
+                                }
+                            }
+                        }
+
+                        factory_tx.send(Ok(())).unwrap();
+
+                        let worker_services = wrap_worker_services(services);
+
+                        // spawn to make sure ServerWorker runs as non boxed future.
+                        spawn(ServerWorker {
+                            conn_rx,
+                            stop_rx,
+                            services: worker_services.into_boxed_slice(),
+                            counter: WorkerCounter::new(idx, waker_queue, counter),
+                            factories: factories.into_boxed_slice(),
+                            state: Default::default(),
+                            shutdown_timeout: config.shutdown_timeout,
+                        });
+                    });
+                });
+            }
+        };
+
+        // wait for service factories initialization
+        factory_rx.recv().unwrap()?;
+
+        Ok(pair)
+    }
+
+    fn restart_service(&mut self, idx: usize, factory_id: usize) {
+        let factory = &self.factories[factory_id];
+        trace!("service {:?} failed, restarting", factory.name(idx));
+        self.services[idx].status = WorkerServiceStatus::Restarting;
+        self.state = WorkerState::Restarting(Restart {
+            factory_id,
+            token: idx,
+            fut: factory.create(),
+        });
+    }
+
+    fn shutdown(&mut self, force: bool) {
+        self.services
+            .iter_mut()
+            .filter(|srv| srv.status == WorkerServiceStatus::Available)
+            .for_each(|srv| {
+                srv.status = if force {
+                    WorkerServiceStatus::Stopped
+                } else {
+                    WorkerServiceStatus::Stopping
+                };
+            });
+    }
+
+    fn check_readiness(&mut self, cx: &mut Context<'_>) -> Result<bool, (usize, usize)> {
+        let mut ready = true;
+        for (idx, srv) in self.services.iter_mut().enumerate() {
+            if srv.status == WorkerServiceStatus::Available
+                || srv.status == WorkerServiceStatus::Unavailable
+            {
+                match srv.service.poll_ready(cx) {
+                    Poll::Ready(Ok(_)) => {
+                        if srv.status == WorkerServiceStatus::Unavailable {
+                            trace!(
+                                "service {:?} is available",
+                                self.factories[srv.factory_idx].name(idx)
+                            );
+                            srv.status = WorkerServiceStatus::Available;
+                        }
+                    }
+                    Poll::Pending => {
+                        ready = false;
+
+                        if srv.status == WorkerServiceStatus::Available {
+                            trace!(
+                                "service {:?} is unavailable",
+                                self.factories[srv.factory_idx].name(idx)
+                            );
+                            srv.status = WorkerServiceStatus::Unavailable;
+                        }
+                    }
+                    Poll::Ready(Err(_)) => {
+                        error!(
+                            "service {:?} readiness check returned error, restarting",
+                            self.factories[srv.factory_idx].name(idx)
+                        );
+                        srv.status = WorkerServiceStatus::Failed;
+                        return Err((idx, srv.factory_idx));
+                    }
+                }
+            }
+        }
+
+        Ok(ready)
+    }
+}
+
+#[derive(Default)]
+enum WorkerState {
+    /// At least one worker service is not ready. New connections are not dispatched.
+    #[default]
+    Unavailable,
+
+    /// All worker services are ready and queued connections are dispatched to them.
+    Available,
+
+    /// A failed worker service is being recreated. New connections are not dispatched.
+    Restarting(Restart),
+
+    /// The worker is gracefully shutting down. Queued connections are dropped while active
+    /// connections are given time to finish.
+    Shutdown(Shutdown),
+}
+
+struct Restart {
+    factory_id: usize,
+    token: usize,
+    fut: LocalBoxFuture<'static, Result<(usize, BoxedServerService), ()>>,
+}
+
+/// State necessary for server shutdown.
+struct Shutdown {
+    // Interval for checking the shutdown progress.
+    timer: Pin<Box<Sleep>>,
+
+    /// Start time of shutdown.
+    start_from: Instant,
+
+    /// Notify caller of the shutdown outcome (graceful/force).
+    tx: oneshot::Sender<bool>,
+}
+
+impl Drop for ServerWorker {
+    fn drop(&mut self) {
+        Arbiter::try_current().as_ref().map(ArbiterHandle::stop);
+    }
+}
+
+impl Future for ServerWorker {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+
+        // `StopWorker` message handler
+        if let Poll::Ready(Some(Stop { graceful, tx })) = this.stop_rx.poll_recv(cx) {
+            let num = this.counter.total();
+            if num == 0 {
+                info!("shutting down idle worker");
+                let _ = tx.send(true);
+                return Poll::Ready(());
+            } else if graceful {
+                info!("graceful worker shutdown; finishing {} connections", num);
+                this.shutdown(false);
+
+                this.state = WorkerState::Shutdown(Shutdown {
+                    timer: Box::pin(sleep(SHUTDOWN_POLL_INTERVAL)),
+                    start_from: Instant::now(),
+                    tx,
+                });
+            } else {
+                info!("force shutdown worker, closing {} connections", num);
+                this.shutdown(true);
+
+                let _ = tx.send(false);
+                return Poll::Ready(());
+            }
+        }
+
+        match this.state {
+            WorkerState::Unavailable => match this.check_readiness(cx) {
+                Ok(true) => {
+                    this.state = WorkerState::Available;
+                    self.poll(cx)
+                }
+                Ok(false) => Poll::Pending,
+                Err((token, idx)) => {
+                    this.restart_service(token, idx);
+                    self.poll(cx)
+                }
+            },
+
+            WorkerState::Restarting(ref mut restart) => {
+                let factory_id = restart.factory_id;
+                let token = restart.token;
+
+                let (token_new, service) =
+                    ready!(restart.fut.as_mut().poll(cx)).unwrap_or_else(|_| {
+                        panic!(
+                            "Can not restart {:?} service",
+                            this.factories[factory_id].name(token)
+                        )
+                    });
+
+                assert_eq!(token, token_new);
+
+                trace!(
+                    "service {:?} has been restarted",
+                    this.factories[factory_id].name(token)
+                );
+
+                this.services[token].created(service);
+                this.state = WorkerState::Unavailable;
+
+                self.poll(cx)
+            }
+
+            WorkerState::Shutdown(ref mut shutdown) => {
+                // drop all pending connections in rx channel.
+                while let Poll::Ready(Some(conn)) = this.conn_rx.poll_recv(cx) {
+                    // WorkerCounterGuard is needed as Accept thread has incremented counter.
+                    // It's guard's job to decrement the counter together with drop of Conn.
+                    let guard = this.counter.guard();
+                    drop((conn, guard));
+                }
+
+                // Wait until the next shutdown check.
+                ready!(shutdown.timer.as_mut().poll(cx));
+
+                if this.counter.total() == 0 {
+                    // graceful shutdown
+                    if let WorkerState::Shutdown(shutdown) = mem::take(&mut this.state) {
+                        let _ = shutdown.tx.send(true);
+                    }
+
+                    Poll::Ready(())
+                } else if shutdown.start_from.elapsed() >= this.shutdown_timeout {
+                    // timeout forceful shutdown
+                    if let WorkerState::Shutdown(shutdown) = mem::take(&mut this.state) {
+                        let _ = shutdown.tx.send(false);
+                    }
+
+                    Poll::Ready(())
+                } else {
+                    // Schedule the next shutdown check.
+                    let time = Instant::now() + SHUTDOWN_POLL_INTERVAL;
+                    shutdown.timer.as_mut().reset(time);
+                    shutdown.timer.as_mut().poll(cx)
+                }
+            }
+
+            // actively poll stream and handle worker command
+            WorkerState::Available => loop {
+                match this.check_readiness(cx) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        trace!("worker is unavailable");
+                        this.state = WorkerState::Unavailable;
+                        return self.poll(cx);
+                    }
+                    Err((token, idx)) => {
+                        this.restart_service(token, idx);
+                        return self.poll(cx);
+                    }
+                }
+
+                // handle incoming io stream
+                match ready!(this.conn_rx.poll_recv(cx)) {
+                    Some(msg) => {
+                        let guard = this.counter.guard();
+                        let _ = this.services[msg.token]
+                            .service
+                            .call((guard, msg.io))
+                            .into_inner();
+                    }
+                    None => {
+                        // The accept channel can close before the server's stop command reaches
+                        // this worker. `stop_rx` was polled above and will wake this worker when
+                        // the command arrives.
+                        return Poll::Pending;
+                    }
+                };
+            },
+        }
+    }
+}
+
+fn wrap_worker_services(services: Vec<(usize, usize, BoxedServerService)>) -> Vec<WorkerService> {
+    services
+        .into_iter()
+        .fold(Vec::new(), |mut services, (idx, token, service)| {
+            assert_eq!(token, services.len());
+            services.push(WorkerService {
+                factory_idx: idx,
+                service,
+                status: WorkerServiceStatus::Unavailable,
+            });
+            services
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Counter;
+
+    #[test]
+    fn max_connection_limit_allows_connection_completion() {
+        let counter = Counter::new(usize::MAX);
+
+        assert!(counter.inc());
+        assert_eq!(counter.total(), 1);
+        assert!(!counter.dec());
+        assert_eq!(counter.total(), 0);
+    }
+}

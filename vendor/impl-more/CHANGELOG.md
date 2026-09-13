@@ -1,0 +1,110 @@
+# Changelog
+
+## Unreleased
+
+## 0.3.7
+
+- Add support for mixed variant shapes, field patterns, and explicit positional and named format arguments in `impl_display_enum!`.
+- Remove temporary allocations from `impl_display_enum!` and support `no_std` for data variants.
+
+## 0.3.6
+
+- Add `forward_into_iterator!`, `forward_from_iterator!`, and `forward_extend!` macros for collection wrappers.
+- Add `forward_debug!`, `forward_binary!`, `forward_octal!`, `forward_lower_hex!`, `forward_upper_hex!`, `forward_lower_exp!`, `forward_upper_exp!`, and `forward_pointer!` macros.
+
+## 0.3.5
+
+- Add `forward_from_str!` macro.
+
+## 0.3.4
+
+- Add `forward_as_ref!`, `forward_as_mut!`, and `forward_as_ref_and_mut!` macros.
+
+## 0.3.3
+
+- No significant changes since `0.3.2`.
+
+## 0.3.2
+
+- Fix `impl_display_enum!` trailing comma handling for variants with named fields.
+- Fix `impl_error_enum!` support for variants with named fields.
+
+## 0.3.1
+
+- No significant changes since `0.3.0`.
+
+## 0.3.0
+
+- Add `impl_newtype_from_into!` macro.
+- Syntax for `impl_from_for_primitive!` macro now matches `impl_from!`.
+
+## 0.2.0
+
+- Add `impl_leaf_error!` macro.
+- Allow `impl_display_enum!` to omit variant's bindings.
+- Remove leaf error support from `impl_error_enum!`.
+- Change delimiter after type of `impl_error_enum!` to `:`.
+- Change delimiter after type of `impl_display!` and `impl_display_enum!` to `:`.
+- Emit `core::error::Error` in `forward_error!` and `impl_error_enum!`.
+- Minimum supported Rust version (MSRV) is now 1.58.
+
+## 0.1.9
+
+- No significant changes since `0.1.8`.
+
+## 0.1.8
+
+- Add `impl_display!` macro.
+
+## 0.1.7
+
+- Add `impl_from_for_primitive!` macro.
+
+## 0.1.6
+
+- Add `forward_error` derive for non-generic error wrappers.
+
+## 0.1.5
+
+- Fix `impl_display_enum` comma handling.
+
+## 0.1.4
+
+- Add basic `Error` derive for enums.
+
+## 0.1.3
+
+- Support type parameters in `forward_display!`.
+
+## 0.1.2
+
+- Add `forward_display!` macro.
+
+## 0.1.1
+
+- No significant changes since `0.1.0`.
+
+## 0.1.0
+
+- Change form of `impl_as_{ref,mut}!`, `impl_deref[_mut]!`, and `impl_{from,into}!` to be clearer when using named fields.
+- Add support for type parameters when using `impl_as_{ref,mut}!`, `impl_deref[_mut]!`, and `impl_{from,into}!`.
+
+## 0.0.4
+
+- No significant changes since `0.0.3`.
+
+## 0.0.3
+
+- Add combined `impl_as_deref_and_mut!` macro.
+- Add `forward_deref_and_mut!` macro.
+- Add `impl_as_ref!`, `impl_as_mut!`, `impl_deref!`, and `impl_deref_mut!` invocations for structs other than newtypes.
+- Add support in `impl_display_enum!` for variables interpolation.
+
+## 0.0.2
+
+- Add basic `impl_display!` macro for enums.
+- Add `impl_from!` and `impl_into!` macros.
+
+## 0.0.1
+
+- Initial release with `impl_as_ref!`, `impl_as_mut!`, `impl_deref!`, and `impl_deref_mut!` macros.
