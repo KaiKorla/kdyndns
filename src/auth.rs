@@ -1,5 +1,5 @@
 use actix_web::HttpRequest;
-use argon2::password_hash::PasswordHash;
+use argon2::password_hash::phc::PasswordHash;
 use argon2::{Argon2, PasswordVerifier};
 use base64::prelude::*;
 use tracing::warn;
@@ -69,14 +69,17 @@ mod tests {
     use crate::config::{AppConfig, UserConfig};
     use actix_web::test::TestRequest;
     use argon2::PasswordHasher;
-    use argon2::password_hash::SaltString;
+    use argon2::password_hash::phc::Salt;
 
     const TEST_SALT: &str = "WnJ1TFZNZEQ0QTR2ZTBJWmU1U3VRZz09";
 
     fn build_test_config() -> AppConfig {
-        let salt = SaltString::from_b64(TEST_SALT).unwrap();
+        let salt = Salt::from_b64(TEST_SALT).unwrap();
         let argon2 = Argon2::default();
-        let hash = argon2.hash_password(b"secret", &salt).unwrap().to_string();
+        let hash = argon2
+            .hash_password_with_salt(b"secret", &salt)
+            .unwrap()
+            .to_string();
 
         AppConfig {
             users: vec![UserConfig {
@@ -94,6 +97,19 @@ mod tests {
         let cfg = build_test_config();
         let user = verify_user(&cfg, "test", "secret");
         assert!(user.is_some());
+    }
+
+    #[test]
+    fn verify_legacy_password_hash() {
+        let mut cfg = build_test_config();
+        // Fixed Argon2 0.5.3 test vector, independent of the current hash generator.
+        cfg.users[0].password_hash =
+            "$argon2id$v=19$m=256,t=2,p=1$c29tZXNhbHQ$nf65EOgLrQMR/uIPnA4rEsF5h7TKyQwu9U1bMCHGi/4"
+                .into();
+
+        assert!(validate_password_hash(&cfg.users[0].password_hash).is_ok());
+        assert!(verify_user(&cfg, "test", "password").is_some());
+        assert!(verify_user(&cfg, "test", "wrong").is_none());
     }
 
     #[test]

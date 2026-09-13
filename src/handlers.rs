@@ -233,7 +233,7 @@ mod tests {
     use super::*;
     use actix_web::{App, test};
     use argon2::PasswordHasher;
-    use argon2::password_hash::SaltString;
+    use argon2::password_hash::phc::Salt;
     use base64::prelude::*;
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
@@ -251,9 +251,12 @@ mod tests {
     }
 
     fn build_test_state_with_limiter(should_fail: bool, auth_limiter: AuthRateLimiter) -> AppState {
-        let salt = SaltString::from_b64(TEST_SALT).unwrap();
+        let salt = Salt::from_b64(TEST_SALT).unwrap();
         let argon2 = argon2::Argon2::default();
-        let hash = argon2.hash_password(b"secret", &salt).unwrap().to_string();
+        let hash = argon2
+            .hash_password_with_salt(b"secret", &salt)
+            .unwrap()
+            .to_string();
 
         let cfg = AppConfig {
             users: vec![UserConfig {
