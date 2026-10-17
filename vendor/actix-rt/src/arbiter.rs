@@ -1,0 +1,340 @@
+use std::{
+    cell::RefCell,
+    fmt,
+    future::Future,
+    io,
+    pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::{Context, Poll},
+    thread,
+};
+
+use futures_core::ready;
+use tokio::sync::mpsc;
+
+use crate::system::{System, SystemCommand};
+
+pub(crate) static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local!(
+    static HANDLE: RefCell<Option<ArbiterHandle>> = const { RefCell::new(None) };
+);
+
+pub(crate) enum ArbiterCommand {
+    Stop,
+    Execute(Pin<Box<dyn Future<Output = ()> + Send>>),
+}
+
+impl fmt::Debug for ArbiterCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArbiterCommand::Stop => write!(f, "ArbiterCommand::Stop"),
+            ArbiterCommand::Execute(_) => write!(f, "ArbiterCommand::Execute"),
+        }
+    }
+}
+
+/// A handle for sending spawn and stop messages to an [Arbiter].
+#[derive(Debug, Clone)]
+pub struct ArbiterHandle {
+    tx: mpsc::UnboundedSender<ArbiterCommand>,
+}
+
+impl ArbiterHandle {
+    pub(crate) fn new(tx: mpsc::UnboundedSender<ArbiterCommand>) -> Self {
+        Self { tx }
+    }
+
+    /// Send a future to the [Arbiter]'s thread and spawn it.
+    ///
+    /// If you require a result, include a response channel in the future.
+    ///
+    /// Returns true if future was sent successfully and false if the [Arbiter] has died.
+    pub fn spawn<Fut>(&self, future: Fut) -> bool
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.tx
+            .send(ArbiterCommand::Execute(Box::pin(future)))
+            .is_ok()
+    }
+
+    /// Send a function to the [Arbiter]'s thread and execute it.
+    ///
+    /// Any result from the function is discarded. If you require a result, include a response
+    /// channel in the function.
+    ///
+    /// Returns true if function was sent successfully and false if the [Arbiter] has died.
+    pub fn spawn_fn<F>(&self, f: F) -> bool
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.spawn(async { f() })
+    }
+
+    /// Returns true if the [Arbiter]'s command channel is still open.
+    ///
+    /// The Arbiter can stop after this check, so this does not guarantee that a subsequent spawn
+    /// call will succeed.
+    pub fn alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
+    /// Instruct [Arbiter] to stop processing it's event loop.
+    ///
+    /// Returns true if stop message was sent successfully and false if the [Arbiter] has
+    /// been dropped.
+    pub fn stop(&self) -> bool {
+        self.tx.send(ArbiterCommand::Stop).is_ok()
+    }
+}
+
+/// An Arbiter represents a thread that provides an asynchronous execution environment for futures
+/// and functions.
+///
+/// When an arbiter is created, it spawns a new [OS thread](thread), and hosts an event loop.
+#[derive(Debug)]
+pub struct Arbiter {
+    tx: mpsc::UnboundedSender<ArbiterCommand>,
+    thread_handle: thread::JoinHandle<()>,
+}
+
+impl Arbiter {
+    /// Spawn a new Arbiter thread and start its event loop.
+    ///
+    /// # Panics
+    /// Panics if a [System] is not registered on the current thread, or if creating the Arbiter's
+    /// thread or Tokio runtime fails.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Arbiter {
+        Self::try_new().expect("Failed to create new Arbiter")
+    }
+
+    /// Try to spawn a new Arbiter thread and start its event loop with the default Tokio runtime.
+    ///
+    /// # Panics
+    /// Panics if a [System] is not registered on the current thread.
+    ///
+    /// # Errors
+    /// Returns an `io::Error` if creating the underlying OS thread or Tokio runtime fails.
+    pub fn try_new() -> io::Result<Arbiter> {
+        Self::try_with_tokio_rt(crate::runtime::default_tokio_runtime)
+    }
+
+    /// Spawn a new Arbiter using the [Tokio Runtime](tokio-runtime) returned from a closure.
+    ///
+    /// The closure may return any type that can be converted into [`Runtime`], such as
+    /// `tokio::runtime::Runtime`, `Arc<tokio::runtime::Runtime>`, or
+    /// `&'static tokio::runtime::Runtime`.
+    ///
+    /// # Panics
+    /// Panics if a [System] is not registered on the current thread, or if creating the Arbiter's
+    /// thread or Tokio runtime fails.
+    ///
+    /// [tokio-runtime]: tokio::runtime::Runtime
+    /// [`Runtime`]: crate::Runtime
+    pub fn with_tokio_rt<F, R>(runtime_factory: F) -> Arbiter
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Into<crate::runtime::Runtime> + Send + 'static,
+    {
+        Self::try_with_tokio_rt(|| Ok(runtime_factory())).expect("Failed to create new Arbiter")
+    }
+
+    /// Try to spawn a new Arbiter using the [Tokio Runtime](tokio-runtime) returned from a closure.
+    ///
+    /// The closure may return any `Result` whose success value can be converted into [`Runtime`],
+    /// such as `tokio::runtime::Runtime`, `Arc<tokio::runtime::Runtime>`, or
+    /// `&'static tokio::runtime::Runtime`.
+    ///
+    /// # Panics
+    /// Panics if a [System] is not registered on the current thread.
+    ///
+    /// # Errors
+    /// Returns an `io::Error` if creating the underlying OS thread or Tokio runtime fails.
+    ///
+    /// [tokio-runtime]: tokio::runtime::Runtime
+    /// [`Runtime`]: crate::Runtime
+    pub fn try_with_tokio_rt<F, R>(runtime_factory: F) -> io::Result<Arbiter>
+    where
+        F: FnOnce() -> io::Result<R> + Send + 'static,
+        R: Into<crate::runtime::Runtime> + Send + 'static,
+    {
+        let sys = System::current();
+        let system_id = sys.id();
+        let arb_id = COUNT.fetch_add(1, Ordering::Relaxed);
+
+        let name = format!("actix-rt|system:{system_id}|arbiter:{arb_id}");
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<io::Result<()>>();
+
+        let thread_handle = thread::Builder::new().name(name.clone()).spawn({
+            let tx = tx.clone();
+            move || {
+                let rt = match runtime_factory() {
+                    Ok(rt) => rt.into(),
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
+
+                let hnd = ArbiterHandle::new(tx);
+
+                System::set_current(sys);
+
+                HANDLE.with(|cell| *cell.borrow_mut() = Some(hnd.clone()));
+
+                // register arbiter
+                let _ = System::current()
+                    .tx()
+                    .send(SystemCommand::RegisterArbiter(arb_id, hnd));
+
+                if ready_tx.send(Ok(())).is_err() {
+                    unreachable!("Arbiter ready signal receiver should not be dropped before send");
+                }
+
+                // run arbiter event processing loop
+                rt.block_on(ArbiterRunner { rx });
+
+                // deregister arbiter
+                let _ = System::current()
+                    .tx()
+                    .send(SystemCommand::DeregisterArbiter(arb_id));
+            }
+        })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Arbiter { tx, thread_handle }),
+            Ok(Err(err)) => {
+                let _ = thread_handle.join();
+                Err(err)
+            }
+            Err(_) => {
+                let _ = thread_handle.join();
+                Err(io::Error::other(format!(
+                    "Arbiter thread {name} panicked during initialization"
+                )))
+            }
+        }
+    }
+
+    /// Sets up an Arbiter runner in a new System using the environment's local set.
+    pub(crate) fn in_new_system() -> ArbiterHandle {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let hnd = ArbiterHandle::new(tx);
+
+        HANDLE.with(|cell| *cell.borrow_mut() = Some(hnd.clone()));
+
+        crate::spawn(ArbiterRunner { rx });
+
+        hnd
+    }
+
+    /// Return a handle to the this Arbiter's message sender.
+    pub fn handle(&self) -> ArbiterHandle {
+        ArbiterHandle::new(self.tx.clone())
+    }
+
+    /// Return a handle to the current thread's Arbiter's message sender.
+    ///
+    /// # Panics
+    /// Panics if no Arbiter is running on the current thread.
+    pub fn current() -> ArbiterHandle {
+        HANDLE.with(|cell| match *cell.borrow() {
+            Some(ref hnd) => hnd.clone(),
+            None => panic!("Arbiter is not running."),
+        })
+    }
+
+    /// Try to get current running arbiter handle.
+    ///
+    /// Returns `None` if no Arbiter has been started.
+    ///
+    /// Unlike [`current`](Self::current), this never panics.
+    pub fn try_current() -> Option<ArbiterHandle> {
+        HANDLE.with(|cell| cell.borrow().clone())
+    }
+
+    /// Stop Arbiter from continuing it's event loop.
+    ///
+    /// Returns true if stop message was sent successfully and false if the Arbiter has been dropped.
+    pub fn stop(&self) -> bool {
+        self.tx.send(ArbiterCommand::Stop).is_ok()
+    }
+
+    /// Send a future to the Arbiter's thread and spawn it.
+    ///
+    /// If you require a result, include a response channel in the future.
+    ///
+    /// Returns true if future was sent successfully and false if the Arbiter has died.
+    #[track_caller]
+    pub fn spawn<Fut>(&self, future: Fut) -> bool
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.tx
+            .send(ArbiterCommand::Execute(Box::pin(future)))
+            .is_ok()
+    }
+
+    /// Send a function to the Arbiter's thread and execute it.
+    ///
+    /// Any result from the function is discarded. If you require a result, include a response
+    /// channel in the function.
+    ///
+    /// Returns true if function was sent successfully and false if the Arbiter has died.
+    #[track_caller]
+    pub fn spawn_fn<F>(&self, f: F) -> bool
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.spawn(async { f() })
+    }
+
+    /// Returns true if the Arbiter's command channel is still open.
+    ///
+    /// The Arbiter can stop after this check, so this does not guarantee that a subsequent spawn
+    /// call will succeed.
+    pub fn alive(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
+    /// Wait for Arbiter's event loop to complete.
+    ///
+    /// Joins the underlying OS thread handle. See [`JoinHandle::join`](thread::JoinHandle::join).
+    pub fn join(self) -> thread::Result<()> {
+        self.thread_handle.join()
+    }
+}
+
+/// A persistent future that processes [Arbiter] commands.
+struct ArbiterRunner {
+    rx: mpsc::UnboundedReceiver<ArbiterCommand>,
+}
+
+impl Future for ArbiterRunner {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // process all items currently buffered in channel
+        loop {
+            match ready!(self.rx.poll_recv(cx)) {
+                // channel closed; no more messages can be received
+                None => return Poll::Ready(()),
+
+                // process arbiter command
+                Some(item) => match item {
+                    ArbiterCommand::Stop => {
+                        return Poll::Ready(());
+                    }
+                    ArbiterCommand::Execute(task_fut) => {
+                        tokio::task::spawn_local(task_fut);
+                    }
+                },
+            }
+        }
+    }
+}

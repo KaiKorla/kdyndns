@@ -1,0 +1,962 @@
+#![allow(clippy::let_underscore_future, missing_docs)]
+
+use std::{
+    future::{pending, ready, Ready},
+    io,
+    net::{self, SocketAddr},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
+    task::{Context, Poll},
+    thread,
+    time::{Duration, Instant},
+};
+
+use actix_rt::{net::TcpStream, time::sleep};
+use actix_server::{Server, TestServer};
+use actix_service::{fn_factory, fn_service, Service};
+use futures_util::{task::noop_waker, FutureExt as _};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio_test::{assert_pending, assert_ready, assert_ready_ok};
+use tokio_util::future::FutureExt as _;
+
+fn unused_addr() -> net::SocketAddr {
+    TestServer::unused_addr()
+}
+
+struct PendingService {
+    ready: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Service<TcpStream> for PendingService {
+    type Response = ();
+    type Error = ();
+    type Future = Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.ready.store(1, Ordering::SeqCst);
+        Poll::Pending
+    }
+
+    fn call(&self, _: TcpStream) -> Self::Future {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ready(Ok(()))
+    }
+}
+
+#[test]
+fn test_bind() {
+    let addr = unused_addr();
+    let (tx, rx) = mpsc::channel();
+
+    let h = thread::spawn(move || {
+        actix_rt::System::new().block_on(async {
+            let srv = Server::build()
+                .workers(1)
+                .disable_signals()
+                .shutdown_timeout(3600)
+                .bind("test", addr, move || {
+                    fn_service(|_| async { Ok::<_, ()>(()) })
+                })?
+                .run();
+
+            tx.send(srv.handle()).unwrap();
+            srv.await
+        })
+    });
+
+    let srv = rx.recv().unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+
+    net::TcpStream::connect(addr).unwrap();
+
+    let _ = srv.stop(true);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+fn test_listen() {
+    let (lst, addr) = TestServer::unused_listener();
+    let (tx, rx) = mpsc::channel();
+
+    let h = thread::spawn(move || {
+        actix_rt::System::new().block_on(async {
+            let srv = Server::build()
+                .workers(1)
+                .disable_signals()
+                .shutdown_timeout(3600)
+                .listen("test", lst, move || {
+                    fn_service(|_| async { Ok::<_, ()>(()) })
+                })?
+                .run();
+
+            tx.send(srv.handle()).unwrap();
+            srv.await
+        })
+    });
+
+    let srv = rx.recv().unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+
+    net::TcpStream::connect(addr).unwrap();
+
+    let _ = srv.stop(true);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+fn plain_tokio_runtime() {
+    let (lst, addr) = TestServer::unused_listener();
+    let (tx, rx) = mpsc::channel();
+
+    let h = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let srv = Server::build()
+                .workers(1)
+                .disable_signals()
+                .listen("test", lst, move || {
+                    fn_factory(|| async {
+                        sleep(Duration::from_millis(10)).await;
+                        Ok::<_, ()>(fn_service(|_| async { Ok::<_, ()>(()) }))
+                    })
+                })?
+                .run();
+
+            tx.send(srv.handle()).unwrap();
+
+            srv.await
+        })
+    });
+
+    let srv = rx.recv().unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+    assert!(net::TcpStream::connect(addr).is_ok());
+
+    let _ = srv.stop(true);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_start() {
+    use std::io::Read;
+
+    use actix_codec::{BytesCodec, Framed};
+    use bytes::Bytes;
+    use futures_util::sink::SinkExt;
+
+    let addr = unused_addr();
+    let (tx, rx) = mpsc::channel();
+
+    let h = thread::spawn(move || {
+        actix_rt::System::new().block_on(async {
+            let srv = Server::build()
+                .backlog(100)
+                .disable_signals()
+                .bind("test", addr, move || {
+                    fn_service(|io: TcpStream| async move {
+                        let mut f = Framed::new(io, BytesCodec);
+                        f.send(Bytes::from_static(b"test")).await.unwrap();
+                        Ok::<_, ()>(())
+                    })
+                })?
+                .run();
+
+            let _ = tx.send((srv.handle(), actix_rt::System::current()));
+
+            srv.await
+        })
+    });
+
+    let (srv, sys) = rx.recv().unwrap();
+
+    let mut buf = [1u8; 4];
+    let mut conn = net::TcpStream::connect(addr).unwrap();
+    let _ = conn.read_exact(&mut buf);
+    assert_eq!(buf, b"test"[..]);
+
+    // pause
+    let _ = srv.pause();
+    thread::sleep(Duration::from_millis(200));
+    let mut conn = net::TcpStream::connect(addr).unwrap();
+    conn.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let res = conn.read_exact(&mut buf);
+    assert!(res.is_err());
+
+    // resume
+    let _ = srv.resume();
+    thread::sleep(Duration::from_millis(100));
+    assert!(net::TcpStream::connect(addr).is_ok());
+    assert!(net::TcpStream::connect(addr).is_ok());
+    assert!(net::TcpStream::connect(addr).is_ok());
+
+    let mut buf = [0u8; 4];
+    let mut conn = net::TcpStream::connect(addr).unwrap();
+    let _ = conn.read_exact(&mut buf);
+    assert_eq!(buf, b"test"[..]);
+
+    // stop
+    let _ = srv.stop(false);
+    sys.stop();
+    h.join().unwrap().unwrap();
+
+    thread::sleep(Duration::from_secs(1));
+    assert!(net::TcpStream::connect(addr).is_err());
+}
+
+#[actix_rt::test]
+async fn test_max_concurrent_connections() {
+    // Note:
+    // A TCP listener would accept connects based on it's backlog setting.
+    //
+    // The limit test on the other hand is only for concurrent TCP stream limiting a work
+    // thread accept.
+
+    use tokio::io::AsyncWriteExt;
+
+    let addr = unused_addr();
+    let (tx, rx) = mpsc::channel();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+
+    let max_conn = 3;
+
+    let h = thread::spawn(move || {
+        actix_rt::System::new().block_on(async {
+            let srv = Server::build()
+                // Set a relative higher backlog.
+                .backlog(12)
+                // max connection for a worker is 3.
+                .max_concurrent_connections(max_conn)
+                .workers(1)
+                .disable_signals()
+                .bind("test", addr, move || {
+                    let counter = counter.clone();
+                    fn_service(move |_io: TcpStream| {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            sleep(Duration::from_secs(20)).await;
+                            counter.fetch_sub(1, Ordering::SeqCst);
+                            Ok::<(), ()>(())
+                        }
+                    })
+                })?
+                .run();
+
+            let _ = tx.send((srv.handle(), actix_rt::System::current()));
+
+            srv.await
+        })
+    });
+
+    let (srv, sys) = rx.recv().unwrap();
+
+    let mut conns = vec![];
+
+    for _ in 0..12 {
+        let conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conns.push(conn);
+    }
+
+    sleep(Duration::from_secs(5)).await;
+
+    // counter would remain at 3 even with 12 successful connection.
+    // and 9 of them remain in backlog.
+    assert_eq!(max_conn, counter_clone.load(Ordering::SeqCst));
+
+    for mut conn in conns {
+        conn.shutdown().await.unwrap();
+    }
+
+    srv.stop(false).await;
+    sys.stop();
+    h.join().unwrap().unwrap();
+}
+
+#[actix_rt::test]
+async fn test_max_concurrent_connections_releases_capacity() {
+    let (tx, rx) = mpsc::channel();
+
+    let srv =
+        TestServer::start_with_builder(Server::build().max_concurrent_connections(1), move || {
+            let tx = tx.clone();
+
+            fn_service(move |_io: TcpStream| {
+                tx.send(()).unwrap();
+                ready(Ok::<_, ()>(()))
+            })
+        });
+
+    let first_conn = srv.connect().unwrap();
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("First connection was not dispatched");
+    drop(first_conn);
+
+    let _second_conn = srv.connect().unwrap();
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("Worker did not accept a second connection after reaching its connection limit");
+}
+
+#[test]
+fn saturated_listener_does_not_starve_another_listener() {
+    use std::io::Write as _;
+
+    let (hot_listener, hot_addr) = TestServer::unused_listener();
+    let (cold_listener, cold_addr) = TestServer::unused_listener();
+    let (server_tx, server_rx) = mpsc::channel();
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let cold_tx = accepted_tx.clone();
+
+    let thread = thread::spawn(move || {
+        actix_rt::System::new().block_on(async {
+            let server = Server::build()
+                .workers(1)
+                .max_concurrent_connections(1)
+                .disable_signals()
+                .listen("hot", hot_listener, move || {
+                    let tx = accepted_tx.clone();
+                    fn_service(move |mut stream: TcpStream| {
+                        tx.send("hot").unwrap();
+                        async move {
+                            // Hold the only connection slot until the client releases it.
+                            stream.read_exact(&mut [0]).await.map(|_| ())
+                        }
+                    })
+                })?
+                .listen("cold", cold_listener, move || {
+                    let tx = cold_tx.clone();
+                    fn_service(move |_stream: TcpStream| {
+                        tx.send("cold").unwrap();
+                        ready(Ok::<_, ()>(()))
+                    })
+                })?
+                .run();
+            server_tx.send(server.handle()).unwrap();
+            server.await
+        })
+    });
+    let server = server_rx.recv().unwrap();
+    let mut first = net::TcpStream::connect(hot_addr).unwrap();
+    assert_eq!(
+        accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "hot"
+    );
+
+    // Both listeners have queued connections before capacity becomes available.
+    let mut queued = (0..4)
+        .map(|_| net::TcpStream::connect(hot_addr).unwrap())
+        .collect::<Vec<_>>();
+    let _cold = net::TcpStream::connect(cold_addr).unwrap();
+    first.write_all(&[0]).unwrap();
+
+    let next = accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let served_cold = if next == "cold" {
+        true
+    } else {
+        queued[0].write_all(&[0]).unwrap();
+        accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap() == "cold"
+    };
+
+    drop(server.stop(false));
+    thread.join().unwrap().unwrap();
+    assert!(
+        served_cold,
+        "Busy listener consumed successive capacity releases"
+    );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_drops_queued_connections() {
+    let addr = unused_addr();
+    let (tx, rx) = mpsc::channel();
+    let ready = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let h = thread::spawn({
+        let ready = ready.clone();
+        let calls = calls.clone();
+
+        move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build_local(tokio::runtime::LocalOptions::default())
+                .unwrap();
+
+            rt.block_on(async {
+                let srv = Server::build()
+                    .backlog(1)
+                    .max_concurrent_connections(1)
+                    .workers(1)
+                    .disable_signals()
+                    .shutdown_timeout(5)
+                    .bind("test", addr, move || {
+                        let ready = ready.clone();
+                        let calls = calls.clone();
+
+                        fn_factory(move || {
+                            let ready = ready.clone();
+                            let calls = calls.clone();
+                            async move { Ok::<_, ()>(PendingService { ready, calls }) }
+                        })
+                    })?
+                    .run();
+
+                tx.send(srv.handle()).unwrap();
+
+                srv.await
+            })
+        }
+    });
+
+    let srv = rx.recv().unwrap();
+
+    // Wait until the worker cannot dispatch new connections.
+    while ready.load(Ordering::SeqCst) == 0 {
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    let _conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sleep(Duration::from_millis(100)).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(3), srv.stop(true))
+        .await
+        .is_ok();
+
+    h.join().unwrap().unwrap();
+
+    assert!(
+        stopped,
+        "Graceful shutdown timed out with a queued connection"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+// TODO: race-y failures detected due to integer underflow when calling Counter::total
+#[actix_rt::test]
+async fn test_service_restart() {
+    use std::task::{Context, Poll};
+
+    use actix_service::{fn_factory, Service};
+    use futures_core::future::LocalBoxFuture;
+    use tokio::io::AsyncWriteExt;
+
+    struct TestService(Arc<AtomicUsize>);
+
+    impl Service<TcpStream> for TestService {
+        type Response = ();
+        type Error = ();
+        type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            let TestService(ref counter) = self;
+            let c = counter.fetch_add(1, Ordering::SeqCst);
+            // Force the service to restart on first readiness check.
+            if c > 0 {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(()))
+            }
+        }
+
+        fn call(&self, _: TcpStream) -> Self::Future {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let addr1 = unused_addr();
+    let addr2 = unused_addr();
+    let (tx, rx) = mpsc::channel();
+    let num = Arc::new(AtomicUsize::new(0));
+    let num2 = Arc::new(AtomicUsize::new(0));
+
+    let num_clone = num.clone();
+    let num2_clone = num2.clone();
+
+    let h = thread::spawn(move || {
+        let num = num.clone();
+        actix_rt::System::new().block_on(async {
+            let srv = Server::build()
+                .backlog(1)
+                .disable_signals()
+                .bind("addr1", addr1, move || {
+                    let num = num.clone();
+                    fn_factory(move || {
+                        let num = num.clone();
+                        async move { Ok::<_, ()>(TestService(num)) }
+                    })
+                })?
+                .bind("addr2", addr2, move || {
+                    let num2 = num2.clone();
+                    fn_factory(move || {
+                        let num2 = num2.clone();
+                        async move { Ok::<_, ()>(TestService(num2)) }
+                    })
+                })?
+                .workers(1)
+                .run();
+
+            let _ = tx.send(srv.handle());
+            srv.await
+        })
+    });
+
+    let srv = rx.recv().unwrap();
+
+    for _ in 0..5 {
+        TcpStream::connect(addr1)
+            .await
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        TcpStream::connect(addr2)
+            .await
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    sleep(Duration::from_secs(3)).await;
+
+    assert!(num_clone.load(Ordering::SeqCst) > 5);
+    assert!(num2_clone.load(Ordering::SeqCst) > 5);
+
+    let _ = srv.stop(false);
+    h.join().unwrap().unwrap();
+}
+
+#[ignore] // non-deterministic on CI
+#[actix_rt::test]
+async fn worker_restart() {
+    use actix_service::{Service, ServiceFactory};
+    use futures_core::future::LocalBoxFuture;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct TestServiceFactory(Arc<AtomicUsize>);
+
+    impl ServiceFactory<TcpStream> for TestServiceFactory {
+        type Response = ();
+        type Error = ();
+        type Config = ();
+        type Service = TestService;
+        type InitError = ();
+        type Future = LocalBoxFuture<'static, Result<Self::Service, Self::InitError>>;
+
+        fn new_service(&self, _: Self::Config) -> Self::Future {
+            let counter = self.0.fetch_add(1, Ordering::Relaxed);
+
+            Box::pin(async move { Ok(TestService(counter)) })
+        }
+    }
+
+    struct TestService(usize);
+
+    impl Service<TcpStream> for TestService {
+        type Response = ();
+        type Error = ();
+        type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+        actix_service::always_ready!();
+
+        fn call(&self, stream: TcpStream) -> Self::Future {
+            let counter = self.0;
+
+            let mut stream = stream.into_std().unwrap();
+            use std::io::Write;
+            let str = counter.to_string();
+            let buf = str.as_bytes();
+
+            let mut written = 0;
+
+            while written < buf.len() {
+                if let Ok(n) = stream.write(&buf[written..]) {
+                    written += n;
+                }
+            }
+            stream.flush().unwrap();
+            stream.shutdown(net::Shutdown::Write).unwrap();
+
+            // force worker 2 to restart service once.
+            if counter == 2 {
+                panic!("Panic on purpose")
+            } else {
+                Box::pin(async { Ok(()) })
+            }
+        }
+    }
+
+    let (lst, addr) = TestServer::unused_listener();
+    let (tx, rx) = mpsc::channel();
+
+    let counter = Arc::new(AtomicUsize::new(1));
+    let h = thread::spawn(move || {
+        let counter = counter.clone();
+        actix_rt::System::new().block_on(async {
+            let srv = Server::build()
+                .disable_signals()
+                .listen("addr", lst, move || TestServiceFactory(counter.clone()))?
+                .workers(2)
+                .run();
+
+            let _ = tx.send(srv.handle());
+
+            srv.await
+        })
+    });
+
+    let srv = rx.recv().unwrap();
+
+    sleep(Duration::from_secs(3)).await;
+
+    let mut buf = [0; 8];
+
+    // worker 1 would not restart and return it's id consistently.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let n = stream.read(&mut buf).await.unwrap();
+    let id = String::from_utf8_lossy(&buf[0..n]);
+    assert_eq!("1", id);
+    stream.shutdown().await.unwrap();
+
+    // worker 2 dead after return response.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let n = stream.read(&mut buf).await.unwrap();
+    let id = String::from_utf8_lossy(&buf[0..n]);
+    assert_eq!("2", id);
+    stream.shutdown().await.unwrap();
+
+    // request to worker 1
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let n = stream.read(&mut buf).await.unwrap();
+    let id = String::from_utf8_lossy(&buf[0..n]);
+    assert_eq!("1", id);
+    stream.shutdown().await.unwrap();
+
+    // TODO: Remove sleep if it can pass CI.
+    sleep(Duration::from_secs(3)).await;
+
+    // worker 2 restarting and work goes to worker 1.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let n = stream.read(&mut buf).await.unwrap();
+    let id = String::from_utf8_lossy(&buf[0..n]);
+    assert_eq!("1", id);
+    stream.shutdown().await.unwrap();
+
+    // TODO: Remove sleep if it can pass CI.
+    sleep(Duration::from_secs(3)).await;
+
+    // worker 2 restarted but worker 1 was still the next to accept connection.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let n = stream.read(&mut buf).await.unwrap();
+    let id = String::from_utf8_lossy(&buf[0..n]);
+    assert_eq!("1", id);
+    stream.shutdown().await.unwrap();
+
+    // TODO: Remove sleep if it can pass CI.
+    sleep(Duration::from_secs(3)).await;
+
+    // worker 2 accept connection again but it's id is 3.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let n = stream.read(&mut buf).await.unwrap();
+    let id = String::from_utf8_lossy(&buf[0..n]);
+    assert_eq!("3", id);
+    stream.shutdown().await.unwrap();
+
+    let _ = srv.stop(false);
+    h.join().unwrap().unwrap();
+}
+
+#[test]
+fn no_runtime_on_init() {
+    use std::{thread::sleep, time::Duration};
+
+    let (lst, _addr) = TestServer::unused_listener();
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let mut srv = Server::build()
+        .workers(2)
+        .disable_signals()
+        .listen("test", lst, {
+            let counter = counter.clone();
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                fn_service(|_| async { Ok::<_, ()>(()) })
+            }
+        })
+        .unwrap()
+        .run();
+
+    fn is_send<T: Send>(_: &T) {}
+    is_send(&srv);
+    is_send(&srv.handle());
+
+    sleep(Duration::from_millis(1_000));
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        let _ = futures_util::poll!(&mut srv);
+
+        // available after the first poll
+        sleep(Duration::from_millis(500));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        let _ = srv.handle().stop(true);
+        srv.await
+    })
+    .unwrap();
+}
+
+#[test]
+fn workers_create_services_in_parallel() {
+    const WORKERS: usize = 4;
+
+    let (lst, _addr) = TestServer::unused_listener();
+    let arrivals = Arc::new((Mutex::new(0), Condvar::new()));
+    let timeouts = Arc::new(AtomicUsize::new(0));
+
+    let mut srv = Server::build()
+        .workers(WORKERS)
+        .disable_signals()
+        .listen("test", lst, {
+            let arrivals = arrivals.clone();
+            let timeouts = timeouts.clone();
+            move || {
+                let (count, all_arrived) = &*arrivals;
+                let mut count = count.lock().unwrap();
+                *count += 1;
+                all_arrived.notify_all();
+
+                let (count, wait) = all_arrived
+                    .wait_timeout_while(count, Duration::from_secs(5), |count| *count < WORKERS)
+                    .unwrap();
+                drop(count);
+                if wait.timed_out() {
+                    timeouts.fetch_add(1, Ordering::SeqCst);
+                }
+
+                fn_service(|_| async { Ok::<_, ()>(()) })
+            }
+        })
+        .unwrap()
+        .run();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async move {
+        let _ = futures_util::poll!(&mut srv);
+        assert_eq!(timeouts.load(Ordering::SeqCst), 0);
+
+        let _ = srv.handle().stop(true);
+        srv.await
+    })
+    .unwrap();
+}
+
+/// Checks that one worker's startup error fails the server while another worker's service
+/// creation is still pending, and that every worker then stops: the pending factory future is
+/// dropped and the created services are dropped with the workers holding them.
+fn startup_fails_on_first_worker_error(run_server: fn(Server) -> io::Result<()>) {
+    let (lst, _addr) = TestServer::unused_listener();
+
+    // clones are held by the worker factories, the pending factory future, and the server
+    // itself; the count returns to one only after all of them are dropped
+    let guard = Arc::new(());
+    let arrivals = Arc::new(AtomicUsize::new(0));
+
+    let srv = Server::build()
+        .workers(3)
+        .disable_signals()
+        .listen("test", lst, {
+            let guard = guard.clone();
+            let arrivals = arrivals.clone();
+            move || {
+                let guard = guard.clone();
+                let arrivals = arrivals.clone();
+                fn_factory(move || {
+                    let guard = guard.clone();
+                    // the first worker to arrive stays pending, the second creates its service,
+                    // the third fails
+                    let role = arrivals.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        match role {
+                            0 => {
+                                let _guard = guard;
+                                pending().await
+                            }
+                            1 => Ok(fn_service(|_: TcpStream| async { Ok::<_, ()>(()) })),
+                            _ => Err(()),
+                        }
+                    }
+                })
+            }
+        })
+        .unwrap()
+        .run();
+
+    let (res_tx, res_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = res_tx.send(run_server(srv));
+    });
+
+    // the error must arrive while another worker's service creation never completes
+    let res = res_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Server should return the error without waiting for the pending worker");
+    assert_eq!(
+        res.unwrap_err().to_string(),
+        "Can not start server service 0"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Arc::strong_count(&guard) > 1 {
+        assert!(Instant::now() < deadline, "Not every worker stopped");
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn startup_fails_on_first_worker_error_tokio() {
+    startup_fails_on_first_worker_error(|srv| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(srv)
+    });
+}
+
+#[test]
+fn startup_fails_on_first_worker_error_actix() {
+    startup_fails_on_first_worker_error(|srv| actix_rt::System::new().block_on(srv));
+}
+
+#[tokio::test]
+async fn dropped_server_releases_listener() {
+    let addr = unused_addr();
+    let mut server = Server::build()
+        .workers(1)
+        .disable_signals()
+        .bind("test", addr, || fn_service(|_| async { Ok::<_, ()>(()) }))
+        .unwrap()
+        .run();
+
+    // Start the acceptor before dropping the server.
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert_pending!(server.poll_unpin(&mut cx));
+    drop(server);
+
+    let _listener =
+        net::TcpListener::bind(addr).expect("Listener should close before drop returns");
+}
+
+fn basic_ready_server() -> (Server, SocketAddr) {
+    let addr = unused_addr();
+    let server = Server::build()
+        .workers(1)
+        .disable_signals()
+        .shutdown_timeout(60)
+        .bind("test", addr, || {
+            fn_service(|mut stream: TcpStream| async move {
+                stream.write_all(b"ready").await.unwrap();
+                pending::<()>().await;
+                drop(stream);
+                Ok::<_, ()>(())
+            })
+        })
+        .unwrap()
+        .run();
+
+    (server, addr)
+}
+
+#[tokio::test]
+async fn dropped_server_interrupts_graceful_shutdown() {
+    let (mut server, addr) = basic_ready_server();
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert_pending!(server.poll_unpin(&mut cx));
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut ready = [0; 5];
+    client
+        .read_exact(&mut ready)
+        .timeout(Duration::from_secs(5))
+        .await
+        .expect("Service should start")
+        .unwrap();
+    assert_eq!(&ready, b"ready");
+
+    let completion = server.handle().stop(true);
+    // Process the stop request, leaving shutdown pending on the active connection.
+    assert_pending!(server.poll_unpin(&mut cx));
+    drop(server);
+    drop(completion);
+
+    let mut buf = [0; 1];
+    let bytes = client
+        .read(&mut buf)
+        .timeout(Duration::from_secs(5))
+        .await
+        .expect("Cancellation should close the connection before the graceful shutdown timeout")
+        .unwrap();
+    assert_eq!(bytes, 0);
+
+    let _listener =
+        net::TcpListener::bind(addr).expect("Listener should close before drop returns");
+}
+
+#[tokio::test]
+async fn non_graceful_shutdown_completes_before_server_drop() {
+    let (mut server, addr) = basic_ready_server();
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert_pending!(server.poll_unpin(&mut cx));
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut ready = [0; 5];
+    client
+        .read_exact(&mut ready)
+        .timeout(Duration::from_secs(5))
+        .await
+        .expect("Service should start")
+        .unwrap();
+    assert_eq!(&ready, b"ready");
+
+    let mut completion = Box::pin(server.handle().stop(false));
+    assert_ready_ok!(server.poll_unpin(&mut cx));
+    assert_ready!(completion.poll_unpin(&mut cx));
+    drop(server);
+
+    let mut buf = [0; 1];
+    let bytes = client
+        .read(&mut buf)
+        .timeout(Duration::from_secs(5))
+        .await
+        .expect("Forced shutdown should close the active connection")
+        .unwrap();
+    assert_eq!(bytes, 0);
+
+    let _listener =
+        net::TcpListener::bind(addr).expect("Listener should close before drop returns");
+}
